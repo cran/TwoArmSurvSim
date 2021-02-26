@@ -1467,3 +1467,308 @@ print_info<-function(Info){
   
 }
 
+
+censor_surv<-function(eventtime,censortime, x){
+  simdata<-data.frame(eventtime=eventtime,censortime=censortime)
+  simdata<- simdata %>% mutate( time=ifelse(censortime<eventtime,censortime,eventtime)) %>% mutate(status=ifelse(censortime<eventtime,0,1))%>% select(-eventtime,-censortime)
+  return(cbind(x,simdata))
+}
+
+
+
+
+
+
+run_simulation_simsurv<-function(samplesize, rand_ratio=c(1,1), blocksize, factors=NULL, accrual_interval=NULL, accrual_rate=NULL,  eventtarget=NULL,maxlpfollowup=NULL, N_simulation=1,alpha=0.05, simsurv1=NULL, simsurv2=NULL){
+  trt<-trt.1<-NULL
+  simsurv_e<-NULL
+  simsurv_c<-NULL
+  trt_timeinterval<-NULL
+  timeinterval<-NULL
+  trtHR<-NULL
+  lambda<-NULL
+  gamma<-NULL
+  gammac<-NULL
+  dropoutrate<-NULL
+  censordist<-NULL
+  
+  start<-Sys.time()
+  
+  TrialInfo<-NULL
+  EventInfo<-NULL
+  ModelResult<-NULL
+  StraModelResult<-NULL
+  AdjModelResult<-NULL
+  
+  for (i in 1:N_simulation){
+    
+    if (!(is.null(simsurv1))){
+      
+      cov_mat <- cov_simu(sample_size = samplesize,factors = factors)
+      generated_covmatrix <- randomize_trt2(cov_mat=cov_mat,blocksize = blocksize,rand_ratio=rand_ratio)
+      design <- generated_covmatrix$dummy_dat %>% rename(trt=trt.1) %>% select(trt, everything())
+      x<-design
+      strata_idx<-unlist(cov_mat$strata_idx)
+      factornames<-names(cov_mat$cov_mat)
+      stratanames<-factornames[strata_idx]
+      xnames<-names(x)
+      cm1<-paste("simsurv_e=",simsurv1)
+      eval(parse(text=cm1))
+      
+      if (!(is.null(simsurv2))){
+        cm2<-paste("simsurv_c=",simsurv2)
+        eval(parse(text=cm2))
+        sim_data<-censor_surv(simsurv_e$eventtime,simsurv_c$eventtime,x)
+      }else{
+        simsurv_c<-data.frame(eventtime=rep(Inf,nrow(simsurv_e)),status=rep(1,nrow(simsurv_e)))
+        sim_data<-censor_surv(simsurv_e$eventtime,simsurv_c$eventtime,x)
+      }
+      
+    }else{
+      
+      if (is.null(trt_timeinterval)){
+        
+        
+        cov_mat <- cov_simu(sample_size = samplesize,factors = factors)
+        generated_covmatrix <- randomize_trt2(cov_mat=cov_mat,blocksize = blocksize,rand_ratio=rand_ratio)
+        design <- generated_covmatrix$dummy_dat %>% rename(trt=trt.1) %>% select(trt, everything())
+        HR<-generated_covmatrix$HR
+        strata_idx<-unlist(cov_mat$strata_idx)
+        factornames<-names(cov_mat$cov_mat)
+        stratanames<-factornames[strata_idx]
+        
+        betas<-log(c(trtHR,HR))
+        x<-design
+        xnames<-names(x)
+        sim_data<-surv_data_simulation(lambda=lambda,gamma=gamma,timeinterval=timeinterval,x=x,betas=betas,dropoutrate=dropoutrate,censordist=censordist,gammac=gammac)
+      }else{
+        cov_mat <- cov_simu(sample_size = samplesize,factors = factors)
+        generated_covmatrix <- randomize_trt2(cov_mat=cov_mat,blocksize = blocksize,rand_ratio=rand_ratio)
+        design <- generated_covmatrix$dummy_dat %>% rename(trt=trt.1) %>% select(trt, everything())
+        HR<-generated_covmatrix$HR
+        strata_idx<-unlist(cov_mat$strata_idx)
+        factornames<-names(cov_mat$cov_mat)
+        stratanames<-factornames[strata_idx]
+        
+        if (is.null(factors)){
+          betas<-data.frame(log(trtHR))
+        }else{
+          betas<-log(cbind(trtHR,t(matrix(rep(HR,length(trtHR)),ncol=length(trtHR)))))
+        }
+        
+        x<-design
+        xnames<-names(x)
+        sim_data<-surv_data_simulation(lambda=lambda,gamma=gamma,x,betas=betas, dropoutrate=dropoutrate,gammac=gammac,censordist=censordist,trt_timeinterval=trt_timeinterval)
+        
+        
+      }
+    }
+    
+    
+    
+    
+    
+    if (!is.null(accrual_interval)){
+      accrual<-sort(step_accrual(samplesize,accrual_interval,accrual_rate))
+      
+    }else{
+      accrual<-rep(0,samplesize)
+    }
+    
+    trialdata<-trial_data_simulation(sim_data,accrual,eventtarget=eventtarget,maxlpfollowup=maxlpfollowup)
+    mcox1<-coxph(Surv(time,status)~trt, data=trialdata$data, ties='breslow')
+    m3<-survdiff(Surv(time,status)~trt, data=trialdata$data, rho=0)
+    m2<-summary(survfit( Surv(time, status)~trt, data=trialdata$data))
+    coxsum<-summary(mcox1)
+    coxoutput<-data.frame(HR=exp(mcox1$coefficients),HR_SE=exp(mcox1$coefficients)*sqrt(mcox1$var), LogHR=mcox1$coefficients,LogHR_SE=coxsum$coefficients[3], cox_p=coxsum$coefficients[5], LogRank_p=1-pchisq(m3$chisq,1))
+    
+    events<-data.frame(N_treatment=m2$table[2,"records"],Event_treatment=m2$table[2,"events"],Median_surv_treatment=m2$table[2,"median"], Median_surv_treatment_CIL=m2$table[2,"0.95LCL"],Median_surv_treatment_CIU=m2$table[2,"0.95UCL"],N_control=m2$table[1,"records"],Event_control=m2$table[1,"events"],Median_surv_control=m2$table[1,"median"], Median_surv_control_CIL=m2$table[1,"0.95LCL"],Median_surv_control_CIU=m2$table[1,"0.95UCL"])
+    
+    TrialInfo<-rbind(TrialInfo,trialdata$Info)
+    ModelResult<-rbind(ModelResult,coxoutput)
+    
+    
+    if (length(factors)>0){
+      
+      factorvar<-NULL
+      for (j in factornames){
+        factorvar<-c(factorvar,xnames[grep(j,xnames)])
+      }
+      factorvar<-paste(factorvar,collapse="+")
+      cm<-paste('mcox1<-coxph(Surv(time,status)~trt+', factorvar,', data=trialdata$data, ties=','\'breslow\'',')',collapse='')
+      eval(parse(text=cm))
+      
+      
+      
+      coxsum<-summary(mcox1)
+      adj_coxoutput<-data.frame(HR=exp(mcox1$coefficients)[1],HR_SE=exp(mcox1$coefficients[1])*sqrt(mcox1$var[1.1]), LogHR=mcox1$coefficients[1],LogHR_SE=coxsum$coefficients[1,3], cox_p=coxsum$coefficients[1,5])
+      AdjModelResult<-rbind(AdjModelResult,adj_coxoutput)
+      
+    }
+    
+    
+    
+    if (length(stratanames)>0){
+      stratavar<-NULL
+      flevel<-prod(unlist(lapply(cov_mat$HR[strata_idx],length)))
+      for (j in stratanames){
+        stratavar<-c(stratavar,xnames[grep(j,xnames)])
+      }
+      #stratified
+      strata<-paste(stratavar,collapse=",")
+      
+      cm<-paste('mcox1<-coxph(Surv(time,status)~trt+strata(', strata,'), data=trialdata$data, ties=','\'breslow\'',')',collapse='')
+      eval(parse(text=cm))
+      
+      cm<-paste("m3<-survdiff(Surv(time,status)~trt+strata(", strata,"), data=trialdata$data, rho=0)")
+      eval(parse(text=cm))
+      
+      cm<-paste("m2<-summary(survfit( Surv(time, status)~trt+strata(", strata,"), data=trialdata$data))")
+      eval(parse(text=cm))
+      
+      coxsum<-summary(mcox1)
+      stra_coxoutput<-data.frame(HR=exp(mcox1$coefficients),HR_SE=exp(mcox1$coefficients)*sqrt(mcox1$var), LogHR=mcox1$coefficients,LogHR_SE=coxsum$coefficients[3], cox_p=coxsum$coefficients[5], LogRank_p=1-pchisq(m3$chisq,1))
+      StraModelResult<-rbind(StraModelResult,stra_coxoutput)
+      
+      events$N_empty_strata<-2*flevel-nrow(m2$table)
+      events$zero_event_strata<-length(which(m2$table[,"events"]==0))
+    }
+    
+    EventInfo<-rbind(EventInfo,events)
+  }
+  rownames(TrialInfo)<-NULL
+  rownames(EventInfo)<-NULL
+  rownames(ModelResult)<-NULL
+  
+  stop<-Sys.time()
+  print(stop-start)
+  
+  writeLines("\n")
+  writeLines("==================================================Trial Settings=================================================")
+  writeLines("\n")
+  writeLines(paste("Total Number of Patients: ", samplesize))
+  writeLines(paste("Randomization Ratio (control vs treatment): ", rand_ratio[1],":",rand_ratio[2]))
+  if ( is.null(blocksize)){
+    writeLines("Blocksize: None")
+  }else{
+    writeLines(paste("Blocksize:",blocksize*2))
+  }
+  
+  if (!is.null(simsurv1)){
+    writeLines(paste("Simsurv command for event: ", simsurv1))
+  }
+  if (!is.null(simsurv2)){
+    writeLines(paste("Simsurv command for dropout: ", simsurv2))
+  }
+  
+  if (!is.null(eventtarget)){
+    writeLines(paste("Target Total Event Number: ", eventtarget))
+  }
+  if (!is.null(maxlpfollowup)){
+    writeLines(paste("Maximum Follow up time for last patient: ",maxlpfollowup))
+  }
+  writeLines(paste("Number of Simulations: ",N_simulation))
+  writeLines("\n")
+  
+  writeLines("==================================================Trial Summary==================================================")
+  writeLines("\n")
+  
+  var_summary<-function(value,rname,power=FALSE,alpha=0.05){
+    if (power){
+      
+      t<-data.frame(N_simulations=length(value), Mean=round(mean(value,na.rm=TRUE),4), SD=round(sd(value,na.rm=TRUE),4), Median=round(median(value,na.rm=TRUE),4), Q1=round(quantile(value,0.25,na.rm=TRUE),4), Q3=round(quantile(value, 0.75,na.rm=TRUE),4), Min=round(min(value,na.rm=TRUE),4),Max=round(max(value,na.rm=TRUE),4), Power=round(length(which(value<alpha))/length(value),4))
+      rownames(t)<-rname
+    }else{
+      t<-data.frame(N_simulations=length(value), Mean=round(mean(value,na.rm=TRUE),4), SD=round(sd(value,na.rm=TRUE),4), Median=round(median(value,na.rm=TRUE),4), Q1=round(quantile(value,0.25,na.rm=TRUE),4), Q3=round(quantile(value, 0.75,na.rm=TRUE),4), Min=round(min(value,na.rm=TRUE),4),Max=round(max(value,na.rm=TRUE),4))
+      rownames(t)<-rname
+    }
+    return(t)
+  }
+  
+  tt<-NULL
+  tt<-rbind(tt,var_summary(EventInfo$N_treatment,"Number of patients (treatment)"))
+  tt<-rbind(tt,var_summary(EventInfo$N_control,"Number of patients (control)"))
+  tt<-rbind(tt,var_summary(EventInfo$Event_treatment,"Number of events (treatment)"))
+  tt<-rbind(tt,var_summary(EventInfo$Event_control,"Number of events (control)"))
+  tt<-rbind(tt,var_summary(EventInfo$Median_surv_treatment,"Median survival time (treatment)"))
+  tt<-rbind(tt,var_summary(EventInfo$Median_surv_control,"Median survival time (control)"))
+  tt<-rbind(tt,var_summary(TrialInfo$Dropout_rate_treatment,"Dropout rate (treatment)"))
+  tt<-rbind(tt,var_summary(TrialInfo$Dropout_rate_control,"Dropout rate (control)"))
+  tt<-rbind(tt,var_summary(TrialInfo$Dropout_rate,"Dropout rate (all)"))
+  tt<-rbind(tt,var_summary(TrialInfo$LastEnrollTime,"Enrollment period"))
+  tt<-rbind(tt,var_summary(TrialInfo$DataCutTime,"Datacut time"))
+  
+  
+  
+  
+  print(tt)
+  
+  writeLines("\n")
+  
+  writeLines("=================================================== Cox Model ===================================================")
+  writeLines("\n")
+  
+  tt<-NULL
+  
+  tt<-rbind(tt,cbind(var_summary(ModelResult$HR,"Hazrd Ratio (treatment vs control)"),Power=""))
+  
+  tt<-rbind(tt,cbind(var_summary(ModelResult$LogHR,"Log Hazrd Ratio (treatment vs control)"),Power=""))
+  tt<-rbind(tt,var_summary(ModelResult$cox_p,"P-value (treatment vs control)",power=TRUE,alpha=alpha))
+  
+  print(tt)
+  writeLines("\n")
+  
+  
+  
+  
+  if (length(stratanames)>0){
+    
+    writeLines("============================================== Stratified Cox Model =============================================")
+    writeLines("\n")
+    
+    tt<-NULL
+    tt<-rbind(tt,cbind(var_summary(StraModelResult$HR,"Hazrd Ratio (treatment vs control)"),Power=""))
+    
+    tt<-rbind(tt,cbind(var_summary(StraModelResult$LogHR,"Log Hazrd Ratio (treatment vs control)"),Power=""))
+    tt<-rbind(tt,var_summary(StraModelResult$cox_p,"P-value (treatment vs control)",power=TRUE,alpha=alpha))
+    
+    print(tt)
+    writeLines("\n")
+    
+    
+  }
+  
+  if (length(factors)>0){
+    
+    
+    
+    writeLines("=============================================== Adjusted Cox Model ==============================================")
+    writeLines("\n")
+    
+    tt<-NULL
+    tt<-rbind(tt,cbind(var_summary(AdjModelResult$HR,"Hazrd Ratio (treatment vs control)"),Power=""))
+    
+    tt<-rbind(tt,cbind(var_summary(AdjModelResult$LogHR,"Log Hazrd Ratio (treatment vs control)"),Power=""))
+    tt<-rbind(tt,var_summary(AdjModelResult$cox_p,"P-value (treatment vs control)",power=TRUE,alpha=alpha))
+    
+    print(tt)
+    writeLines("\n")
+    writeLines("=================================================================================================================")
+    
+  }
+  
+  outdata<-list(TrialInfo=TrialInfo,EventInfo=EventInfo,ModelResult=ModelResult)
+  if (length(stratanames)>0){
+    outdata<-c(outdata,list(StraModelResult=StraModelResult))
+  }
+  if (length(factors)>0){
+    outdata<-c(outdata,list(AdjModelResult=AdjModelResult))
+  }
+  
+  if (N_simulation==1){
+    outdata<-c(outdata,list(Data=trialdata$data))
+  }
+  
+  return(outdata)
+}
+
